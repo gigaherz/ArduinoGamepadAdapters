@@ -10,3 +10,4 @@ A small collection of Arduino programs that implement adapters for a couple of o
 
 ## TODO
 * Support analog triggers when using a PS2 controller (DualShock 2) or compatible.
+* Hookup documentation and schematics.
