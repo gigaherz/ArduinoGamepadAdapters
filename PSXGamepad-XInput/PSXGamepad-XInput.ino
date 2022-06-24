@@ -4,11 +4,14 @@
 // Requires library:
 //   https://github.com/dmadison/ArduinoXInput
 
+#include <math.h>
+#include <XInput.h>
+
 #define DEBUG_SERIAL false
 
 #if DEBUG_SERIAL
-#define SOFT_SERIAL true
-#define DEBUG_CMD true
+#define SOFT_SERIAL false
+#define DEBUG_CMD false
 #define DEBUG_PSX true
 #endif
 
@@ -25,8 +28,7 @@
 #define ENABLE_RUMBLE true
 #define DEBUG_RUMBLE false
 
-#include <math.h>
-#include <XInput.h>
+#define ANALOG_BUTTONS false
 
 /* 0 or positive number: success, negative number: error code */
 static int error; /* used to contain the error code for the DO macros */
@@ -35,7 +37,7 @@ static int _error_source;
 // when true, adds a delay between commands
 static boolean initializationDelayHack = false;
 
-typedef int RESULT;
+typedef int32_t RESULT;
 #define STATUS_SUCCESS 0
 #define STATUS_NO_ACK -1
 
@@ -49,6 +51,9 @@ typedef int RESULT;
 
 SoftwareSerial debugSerial(14, 15); // RX, TX
 #endif
+
+#define SLOWMODE_DELAY (20 * 1000) /* 20 seconds */
+int32_t cyclesWithoutActivity = 0;
 
 // ============X============
 // | o o o | o o o | o o o | Controller plug
@@ -102,13 +107,50 @@ struct PSX_t {
     uint8_t LX;
     uint8_t LY;
   } Axes;
+  struct ANALOG_BUTTONS_t {
+    uint8_t Rt;
+    uint8_t Lt;
+    uint8_t Up;
+    uint8_t Dn;
+    uint8_t T;
+    uint8_t C;
+    uint8_t X;
+    uint8_t S;
+    uint8_t L1;
+    uint8_t R1;
+    uint8_t L2;
+    uint8_t R2;
+  } AnalogButtons;
 } oldPsx = {0}, psx = {0};
+
+#define RESPONSE_BIT_BUTTONS1        0x00001L
+#define RESPONSE_BIT_BUTTONS2        0x00002L
+#define RESPONSE_BIT_RX              0x00004L
+#define RESPONSE_BIT_RY              0x00008L
+#define RESPONSE_BIT_LX              0x00010L
+#define RESPONSE_BIT_LY              0x00020L
+#define RESPONSE_BIT_ANALOG_LEFT     0x00040L
+#define RESPONSE_BIT_ANALOG_RIGHT    0x00080L
+#define RESPONSE_BIT_ANALOG_UP       0x00100L
+#define RESPONSE_BIT_ANALOG_DOWN     0x00200L
+#define RESPONSE_BIT_ANALOG_TRIANGLE 0x00400L
+#define RESPONSE_BIT_ANALOG_CIRCLE   0x00800L
+#define RESPONSE_BIT_ANALOG_CROSS    0x01000L
+#define RESPONSE_BIT_ANALOG_SQUARE   0x02000L
+#define RESPONSE_BIT_ANALOG_L1       0x04000L
+#define RESPONSE_BIT_ANALOG_R1       0x08000L
+#define RESPONSE_BIT_ANALOG_L2       0x10000L
+#define RESPONSE_BIT_ANALOG_R2       0x20000L
+
+#define ANALOG_BUTTONS 0 // (RESPONSE_BIT_ANALOG_L2 | RESPONSE_BIT_ANALOG_R2)
 
 int oldExtraButton = 0;
 #if DEBUG_SERIAL
 int oldBigRumble = 0;
 int oldSmallRumble = 0;
 #endif
+
+int isConfigurationMode = 0;
 
 /* startup rumble animation */
 int smallMotorPulse = 0;
@@ -123,9 +165,25 @@ void DEBUG_blinkStage(int stage) {
     digitalWrite(17, 0);
     delay(100);
     digitalWrite(17, 1);
+    ftoa()
   }
 #endif
 }
+
+#if DEBUG_SERIAL
+void DEBUG_printf(const char* fmt, ...)
+{
+  char str[200];
+  va_list args;
+  va_start(args, fmt);
+  vsprintf(str, fmt, args);
+  va_end(args);
+  SERIAL.print(str);
+}
+#define DBGPRINT DEBUG_printf
+#else
+#define DBGPRINT(f, a...)
+#endif
 
 /* pin abstraction */
 boolean PIN_readAck() {
@@ -211,6 +269,8 @@ RESULT PSX_exchangeMessage0(uint8_t result[], int reslen, uint8_t command[], int
   int words = result[1] & 15;
   int totalLength = words * 2 + 3;
 
+  isConfigurationMode = mode == 0xF;
+
   int limit = totalLength - 1;
   for (int i = 3; i <= limit; i++)
   {
@@ -232,15 +292,24 @@ RESULT PSX_exchangeMessage0(uint8_t result[], int reslen, uint8_t command[], int
 
 RESULT PSX_exchangeMessage(uint8_t result[], int reslen, uint8_t command[], int cmdlen)
 {
+#if DEBUG_CMD
+  SERIAL.print("Sending: ");
+  for (int i = 0; i < cmdlen; i++) {
+    static char dbg[10];
+    sprintf(dbg, "%02x ", command[i]);
+    SERIAL.print(dbg);
+  }
+#endif
+
   PIN_beginMessage();
-  
+
   PIN_clockDelay();
   PIN_clockDelay();
 
   RESULT r = PSX_exchangeMessage0(result, reslen, command, cmdlen);
 
 #if DEBUG_CMD
-  SERIAL.print("Data received: ");
+  SERIAL.print(" -  received: ");
   for (int i = 0; i < r; i++) {
     static char dbg[10];
     sprintf(dbg, "%02x ", result[i]);
@@ -252,10 +321,10 @@ RESULT PSX_exchangeMessage(uint8_t result[], int reslen, uint8_t command[], int 
 
   if (initializationDelayHack)
     delay(5);
-  
+
   PIN_clockDelay();
   PIN_clockDelay();
-    
+
   PIN_endMessage();
 
   return r;
@@ -273,7 +342,7 @@ RESULT PSX_sendConfigurationModeMessage43(boolean enter)
   uint8_t ModeChange[] = {0x01, 0x43, 0x00, enter ? 0x01 : 0x00 };
 
   DO_R(PSX_sendMessage( ModeChange, sizeof(ModeChange) ), 6)
-  return STATUS_SUCCESS;
+  return error;
 }
 
 RESULT PSX_sendActuatorMappingMessage4D(boolean enable)
@@ -287,8 +356,37 @@ RESULT PSX_sendActuatorMappingMessage4D(boolean enable)
   }
 
   DO_R(PSX_sendMessage( ActuatorsMap, sizeof(ActuatorsMap) ), 7)
+  return error;
+}
 
-  return STATUS_SUCCESS;
+RESULT PSX_sendResponseFormatMessage41()
+{
+  uint8_t ResponseMessage[] = {0x01, 0x41, 0x00, 0x5AF, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A };
+  uint8_t ResponseFormat[9];
+
+  DO_R(PSX_exchangeMessage( ResponseFormat, sizeof(ResponseFormat), ResponseMessage, sizeof(ResponseMessage) ), 7)
+
+  uint32_t fmt = ResponseFormat[5];
+  fmt = (fmt<<8)| ResponseFormat[4]; 
+  fmt = (fmt<<8)| ResponseFormat[3]; 
+
+  return fmt;
+}
+
+#define VALID_MASK  0x3FFFFL
+#define FORCED_BITS 0x0003FL
+RESULT PSX_sendResponseBytesMessage4F(uint32_t bitField)
+{
+  uint8_t ResponseBytesMessage[] = {0x01, 0x4F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+  bitField = (bitField | FORCED_BITS) & VALID_MASK;
+
+  ResponseBytesMessage[3] = (bitField) & 0xFF;
+  ResponseBytesMessage[4] = (bitField >> 8) & 0xFF;
+  ResponseBytesMessage[5] = (bitField >> 16) & 0x03;
+
+  DO_R(PSX_sendMessage( ResponseBytesMessage, sizeof(ResponseBytesMessage) ), 10)
+  return error;
 }
 
 RESULT PSX_exchangeControllerStatus42(uint8_t result[], uint8_t reslen, uint8_t small, uint8_t big)
@@ -296,7 +394,7 @@ RESULT PSX_exchangeControllerStatus42(uint8_t result[], uint8_t reslen, uint8_t 
   uint8_t ShockString4[] = {0x01, 0x42, 0x00, small, big, 0x01 };
 
   DO_R(PSX_exchangeMessage( result, reslen, ShockString4, sizeof(ShockString4) ), 8)
-  return STATUS_SUCCESS;
+  return error;
 }
 
 RESULT PSX_sendControllerModeMessage44(boolean analog, boolean lock)
@@ -304,24 +402,19 @@ RESULT PSX_sendControllerModeMessage44(boolean analog, boolean lock)
   uint8_t Mode[] = {0x01, 0x44, 0x00, analog ? 0x01 : 0x00, lock ? 0x03 : 0x00, 0x00, 0x00, 0x00, 0x00 };
 
   DO_R(PSX_sendMessage( Mode, sizeof(Mode) ), 9)
-  return STATUS_SUCCESS;
+  return error;
 }
 
-RESULT PSX_enterConfigurationMode()
+RESULT PSX_requireConfigurationMode(boolean enabled)
 {
-  return PSX_sendConfigurationModeMessage43(true);
-}
-
-RESULT PSX_leaveConfigurationMode()
-{
-  return PSX_sendConfigurationModeMessage43(false);
+  if (isConfigurationMode != enabled)
+    return PSX_sendConfigurationModeMessage43(enabled);
 }
 
 RESULT PSX_enableVibration()
 {
-  DO(PSX_enterConfigurationMode())
+  DO(PSX_requireConfigurationMode(true))
   DO(PSX_sendActuatorMappingMessage4D(true))
-  DO(PSX_leaveConfigurationMode())
   return STATUS_SUCCESS;
 }
 
@@ -331,35 +424,42 @@ RESULT PSX_disableVibration()
   uint8_t data[64];
   PSX_exchangeControllerStatus42(data, sizeof(data), 0, 0);
 
-  DO(PSX_enterConfigurationMode())
+  DO(PSX_requireConfigurationMode(true))
   DO(PSX_sendActuatorMappingMessage4D(false))
-  DO(PSX_leaveConfigurationMode())
   return STATUS_SUCCESS;
 }
 
 RESULT PSX_changeControllerMode(boolean analog, boolean lock)
 {
-  DO(PSX_enterConfigurationMode())
+  DO(PSX_requireConfigurationMode(true))
   DO(PSX_sendControllerModeMessage44(analog, lock))
-  DO(PSX_leaveConfigurationMode())
   return STATUS_SUCCESS;
 }
 
-RESULT PSX_initialize(boolean analog, boolean lock, boolean enableDualShock)
+RESULT PSX_changeAnalogButtonsMode(uint32_t buttonMask)
 {
-  uint8_t data[64];
+  DO(PSX_requireConfigurationMode(true))
+  DO(PSX_sendResponseBytesMessage4F(buttonMask))
+  return STATUS_SUCCESS;
+}
+
+RESULT PSX_getCurrentResponseBytes()
+{
+  DO(PSX_requireConfigurationMode(true))
+  return PSX_sendResponseFormatMessage41();
+}
+
+RESULT PSX_initialize(boolean analog, boolean lock, boolean enableDualShock, int pressureMask)
+{
+  //uint8_t data[64];
   initializationDelayHack = true;
-  int error1 = PSX_exchangeControllerStatus42(data, sizeof(data), 0, 0);
-  int error2 = PSX_enterConfigurationMode();
-  int error3 = PSX_sendControllerModeMessage44(analog, lock);
-  int error6 = PSX_sendActuatorMappingMessage4D(enableDualShock);
-  int error7 = PSX_leaveConfigurationMode();
+  //DO(PSX_exchangeControllerStatus42(data, sizeof(data), 0, 0));
+  DO(PSX_requireConfigurationMode(true))
   initializationDelayHack = false;
-  if (error1) return error1;
-  if (error2) return error2;
-  if (error3) return error3;
-  if (error6) return error6;
-  if (error7) return error7;
+  if (analog)
+    DO(PSX_sendResponseBytesMessage4F(pressureMask))
+  DO(PSX_sendControllerModeMessage44(analog, lock))
+  DO(PSX_sendActuatorMappingMessage4D(enableDualShock))
   return STATUS_SUCCESS;
 }
 
@@ -459,7 +559,7 @@ void UTIL_adjustDeadzoneTrig(uint8_t *axisX, uint8_t *axisY) {
 void DEBUG_printPsx(struct PSX_t * data) {
   char text[200];
   sprintf(text,
-          "MODE: %d ||DPAD: {%d,%d,%d,%d} || BTN: {%d,%d,%d,%d},{%d,%d},{%d,%d},{%d,%d},{%d,%d} || AXIS: {%02x,%02x},{%02x,%02x}\n",
+          "MODE: %d ||DPAD: {%d,%d,%d,%d} || BTN: {%d,%d,%d,%d},{%d,%d},{%d,%d},{%d,%d},{%d,%d} || AXIS: {%02x,%02x},{%02x,%02x} || ABTN: {%02x,%02x,%02x,%02x},{%02x,%02x,%02x,%02x},{%02x,%02x},{%02x,%02x}\n",
           data->Mode,
           data->Buttons.Up, data->Buttons.Rt, data->Buttons.Dn, data->Buttons.Lt,
           data->Buttons.X, data->Buttons.C, data->Buttons.S, data->Buttons.T,
@@ -468,7 +568,11 @@ void DEBUG_printPsx(struct PSX_t * data) {
           data->Buttons.L2, data->Buttons.R2,
           data->Buttons.L3, data->Buttons.R3,
           data->Axes.LX, data->Axes.LY,
-          data->Axes.RX, data->Axes.RY
+          data->Axes.RX, data->Axes.RY,
+          data->AnalogButtons.Up, data->AnalogButtons.Rt, data->AnalogButtons.Dn, data->AnalogButtons.Lt,
+          data->AnalogButtons.X, data->AnalogButtons.C, data->AnalogButtons.S, data->AnalogButtons.T,
+          data->AnalogButtons.L1, data->AnalogButtons.R1,
+          data->AnalogButtons.L2, data->AnalogButtons.R2
          );
   SERIAL.print(text);
 }
@@ -540,6 +644,9 @@ void DEBUG_displayErrorBlink()
 #endif
 }
 
+boolean disableDualshock2 = false;
+uint32_t wantedMask = ANALOG_BUTTONS;
+uint32_t bytesMask = FORCED_BITS;
 void setup() {
   // Setup pins
   pinMode(PIN_ACK,  INPUT_PULLUP);
@@ -566,6 +673,7 @@ void setup() {
   //XInput.setAutoSend(false);  // disable automatic output
   XInput.setRange(JOY_LEFT, 0, 255);
   XInput.setRange(JOY_RIGHT, 0, 255);
+  XInput.setTriggerRange(0, 255);
   XInput.begin();
 
 
@@ -575,32 +683,39 @@ void setup() {
   SERIAL.println("Hello, world?");
 #endif
 
-  if (PSX_initialize(true, false, ENABLE_RUMBLE) < 0)
+  bytesMask = ANALOG_BUTTONS;
+  if (PSX_initialize(true, false, ENABLE_RUMBLE, bytesMask) < 0)
   {
     DEBUG_displayErrorBlink();
   }
+
+  delay(50);
+
+  cyclesWithoutActivity = 0;
 }
 
 int startupWait = 0;
+int lastMode = 0;
 void loop()
 {
+  uint8_t data0[64] = { 0 };
   uint8_t data[64] = { 0 };
   uint8_t bigRumble = 0;
   uint8_t smallRumble = 0;
-  
+
 #if ENABLE_RUMBLE
   if (startupWait <= 10) startupWait++;
   if (startupWait == 10)
-  {      
+  {
     smallMotorPulse = 1;
     bigMotorPulse = 1;
   }
 
   bigRumble = XInput.getRumbleLeft();
   smallRumble = XInput.getRumbleRight();
-  
+
 #if DEBUG_RUMBLE
-  bigRumble = max(bigRumble, 2*(127-psx.Axes.LY));
+  bigRumble = max(bigRumble, 2 * (127 - psx.Axes.LY));
   smallRumble = max(smallRumble, psx.Axes.RY < 30 ? 255 : 0);
 #endif
 
@@ -627,12 +742,70 @@ void loop()
 
 #endif
 
-  if (PSX_exchangeControllerStatus42(data, sizeof(data), smallRumble > 127 ? 255 : 0, bigRumble) < 0)
+  if (PSX_requireConfigurationMode(false) < 0)
   {
     DEBUG_displayErrorBlink();
   }
-  
+
+int dataL = PSX_exchangeControllerStatus42(data0, sizeof(data0), smallRumble > 127 ? 255 : 0, bigRumble);
+  if (dataL < 0)
+  {
+    DEBUG_displayErrorBlink();
+    for (int i = 0; i < 21; i++)
+    {
+      data[i] = 0;
+    }
+  }
+  else
+  {
+    int i,j;
+    for (i = 0, j = 0; i < 21; i++)
+    {
+      if (i < 3 || ((bytesMask >> (i - 3)) & 1) != 0)
+        data[i] = data0[j++];
+      else
+        data[i] = 0;
+    }
+    dataL = j;
+  }
+
+#if DEBUG_SERIAL
+  DBGPRINT("Data1 (%lx): ", bytesMask);
+  for (int i = 0; i < 21; i++) {
+    static char dbg[10];
+    sprintf(dbg, "%02x ", data[i]);
+    SERIAL.print(dbg);
+  }
+  SERIAL.println();
+  delay(5);
+#endif
+
   int mode = psx.Mode = (data[1]) >> 4;
+
+  if (mode != oldPsx.Mode)
+  {
+    if (mode == 7)
+    {
+      bytesMask = wantedMask | FORCED_BITS;
+      if (PSX_changeAnalogButtonsMode(bytesMask) < 0)
+      {
+        DEBUG_displayErrorBlink();
+      }
+      #if 0
+      int32_t mask = PSX_getCurrentResponseBytes(); // if setting the analog triggers didn't work, then continue as if this was a ps1 controller
+      if (mask < 0)
+      {
+        DBGPRINT("Error setting byte mask!\n");
+        disableDualshock2 = true;
+        bytesMask = FORCED_BITS;
+      }
+      else if (mask != bytesMask)
+      {
+        bytesMask = mask | FORCED_BITS;
+      }
+      #endif
+    }
+  }
 
   psx.Buttons.Sl = ((data[3] >> 0) & 1) ^ 1;
   psx.Buttons.L3 = ((data[3] >> 1) & 1) ^ 1;
@@ -664,6 +837,19 @@ void loop()
     psx.Buttons.Rt = Rt;
     psx.Buttons.Dn = Dn;
     psx.Buttons.Lt = Lt;
+
+    psx.AnalogButtons.Rt = data[9];
+    psx.AnalogButtons.Lt = data[10];
+    psx.AnalogButtons.Up = data[11];
+    psx.AnalogButtons.Dn = data[12];
+    psx.AnalogButtons.T = data[13];
+    psx.AnalogButtons.C = data[14];
+    psx.AnalogButtons.X = data[15];
+    psx.AnalogButtons.S = data[16];
+    psx.AnalogButtons.L1 = data[17];
+    psx.AnalogButtons.R1 = data[18];
+    psx.AnalogButtons.L2 = data[19];
+    psx.AnalogButtons.R2 = data[20];
   }
   else
   {
@@ -715,8 +901,14 @@ void loop()
   // Shoulder buttons
   changes += HOST_handleButton(BUTTON_LB, psx.Buttons.L1, oldPsx.Buttons.L1);
   changes += HOST_handleButton(BUTTON_RB, psx.Buttons.R1, oldPsx.Buttons.R1);
-  changes += HOST_handleTriggerDigital(TRIGGER_LEFT,  psx.Buttons.L2, oldPsx.Buttons.L2);  // TODO: Analog triggers in DS2 mode
-  changes += HOST_handleTriggerDigital(TRIGGER_RIGHT, psx.Buttons.R2, oldPsx.Buttons.R2);
+  if (bytesMask & RESPONSE_BIT_ANALOG_L2)
+    changes += HOST_handleTriggerAnalog(TRIGGER_LEFT,  psx.AnalogButtons.L2, oldPsx.AnalogButtons.L2);  // TODO: Analog triggers in DS2 mode
+  else
+    changes += HOST_handleTriggerDigital(TRIGGER_LEFT,  psx.Buttons.L2, oldPsx.Buttons.L2);  // TODO: Analog triggers in DS2 mode
+  if (bytesMask & RESPONSE_BIT_ANALOG_R2)
+    changes += HOST_handleTriggerAnalog(TRIGGER_RIGHT, psx.AnalogButtons.R2, oldPsx.AnalogButtons.R2);
+  else
+    changes += HOST_handleTriggerDigital(TRIGGER_RIGHT, psx.Buttons.R2, oldPsx.Buttons.R2);
 
   // Center buttons and stick buttons
   changes += HOST_handleButton(BUTTON_L3, psx.Buttons.L3, oldPsx.Buttons.L3);
@@ -736,14 +928,19 @@ void loop()
   oldPsx = psx;
   oldExtraButton = extraButton;
   if (changes > 0)
+  {
     XInput.send();
+    cyclesWithoutActivity = 0;
+  }
+  else if (cyclesWithoutActivity <= SLOWMODE_DELAY)
+  {
+    cyclesWithoutActivity++;
+  }
 
 #if DEBUG_PSX
   if (bigRumble != oldBigRumble || smallRumble != oldSmallRumble)
   {
-    char str[100];
-    sprintf(str, "RUMBLE! %d %d\n", smallRumble, bigRumble);
-    SERIAL.print(str);
+    DBGPRINT("RUMBLE! %d %d\n", smallRumble, bigRumble);
   }
   oldBigRumble = bigRumble;
   oldSmallRumble = smallRumble;
@@ -751,5 +948,9 @@ void loop()
   if (changes > 0)
     DEBUG_printPsx(&psx);
 #endif
-  delay(1/*ms*/);
+
+  if (cyclesWithoutActivity >= SLOWMODE_DELAY)
+    delay(100/*ms*/);
+  else
+    delay(1/*ms*/);
 }
